@@ -4,6 +4,9 @@ use ToughDeveloper\ImageResizer\Models\Settings;
 use October\Rain\Database\Attach\File;
 use Tinify\Tinify;
 use Tinify\Source;
+use Cache;
+use Storage;
+use File as FileHelper;
 
 class Image
 {
@@ -33,6 +36,16 @@ class Image
     protected $options;
 
     /**
+     * @var int|bool
+     */
+    protected $width;
+
+    /**
+     * @var int|bool
+     */
+    protected $height;
+
+    /**
      * Thumb filename
      */
     protected $thumbFilename;
@@ -53,7 +66,9 @@ class Image
             return;
         }
 
-        $this->file->file_name = $filePath;
+        $this->file->file_name = basename($filePath);
+
+        $this->file->disk_name = $this->getDiskName($filePath);
 
         $this->filePath = (file_exists($filePath))
             ? $filePath
@@ -71,51 +86,52 @@ class Image
      */
     public function resize($width = false, $height = false, $options = [])
     {
-        // Parse the default settings
-        $this->options = $this->parseDefaultSettings($options);
+        $options = $this->parseDefaultSettings($options);
 
-        // Not a file? Display the not found image
-        if (!is_file($this->filePath)) {
-            return $this->notFoundImage($width, $height);
-        }
-    
-        // Not a supported extension? Return the image
-        if (!$this->hasSupportedExtension()) {
-            return $this;
-        }
+        $thumbPath = $this->file->getDiskPath($this->file->getThumbFilename($width, $height, $options));
 
-        // If extension is auto, set the actual extension
-        if (strtolower($this->options['extension']) == 'auto') {
-           $this->options['extension'] = $this->file->getExtension();
-        }
+        Cache::rememberForever($this->file->getCacheKey($thumbPath), function () use ($thumbPath, $width, $height, $options) {
+            if (!$this->storageCmd('exists', $thumbPath)) {
+                $this->file->fromFile($this->filePath);
 
-        // Set a disk name, this enables caching
-        $this->file->disk_name = $this->cacheKey();
-
-        // Set the thumbfilename to save passing variables to many functions
-        $this->thumbFilename = $this->getThumbFilename($width, $height);
-
-        // If the image is cached, don't try resized it.
-        if (! $this->isImageCached()) {
-            // Set the file to be created from another file
-            $this->file->fromFile($this->filePath);
-
-            // Resize it
-            $thumb = $this->file->getThumb($width, $height, $this->options);
-
-            // Not a gif file? Compress with tinyPNG
-            if ($this->isCompressionEnabled()) {
-                $this->compressWithTinyPng();
+                $this->file->getThumb($width, $height, $options);
             }
+        });
 
-            // Touch the cached image with the original mtime to align them
-            touch($this->getCachedImagePath(), filemtime($this->filePath));
-            
-            $this->deleteTempFile();
+        return $this->storageCmd('url', $thumbPath);
+    }
+
+    protected function storageCmd()
+    {
+        $args = func_get_args();
+        $command = array_shift($args);
+
+        if (FileHelper::isLocalDisk($this->file->getDisk())) {
+
+            if ($command != 'url') {
+                $localRootPath = storage_path('app');
+
+                $interface = 'File';
+
+                $args = array_map(function ($value) use ($localRootPath) {
+                    return $localRootPath . '/' . $value;
+                }, $args);
+
+                $result = forward_static_call_array([$interface, $command], $args);
+            } else {
+                $result = Storage::disk('local')->url($args[0]);
+            }
+        }
+        else {
+            $result = call_user_func_array([$this->file->getDisk(), $command], $args);
         }
 
-        // Return the URL
-        return $this;
+        return $result;
+    }
+
+    protected function getDiskName(string $filePath)
+    {
+        return md5($filePath);
     }
 
     /**
@@ -130,6 +146,8 @@ class Image
                 ? url(str_replace(base_path() . '/', '', $this->filePath))
                 : $this->filePath;
         }
+
+        $thumbFile = $this->getThumbFilename($this->width, $this->height, $this->options);
 
         $filePath = $this->file->getStorageDirectory() . $this->getPartitionDirectory() . $this->thumbFilename;
 
@@ -168,8 +186,7 @@ class Image
 
         foreach($folders as $folder)
         {
-            if (str_contains($path, $folder))
-            {
+            if (str_contains($path, $folder)) {
                 $paths = explode($folder, $path, 2);
                 return base_path($folder . end($paths));
             }
@@ -283,13 +300,13 @@ class Image
             return false;
         }
 
-        // if cached image mtime match, the image is already cached
+        /*// if cached image mtime match, the image is already cached
         if (filemtime($this->filePath) === filemtime($cached_img)) {
             return true;
         }
 
         // delete older cached file
-        unlink($cached_img);
+        unlink($cached_img);*/
 
         // generate new cache file
         return false;
